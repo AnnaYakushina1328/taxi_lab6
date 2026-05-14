@@ -1,16 +1,17 @@
 openapi: 3.0.3
+
 info:
   title: Taxi Service API
-  version: 1.1.0
+  version: 1.2.0
   description: >
-    REST API for taxi ordering system built with Yandex userver.
-    The project uses PostgreSQL for the original relational part
-    and MongoDB for the document-oriented part of lab 04.
+    REST API for a taxi ordering service.
+    Lab 05 adds response caching and rate limiting for selected endpoints.
 
 servers:
   - url: http://127.0.0.1:8080
 
 tags:
+  - name: Health
   - name: Users
   - name: Auth
   - name: Drivers
@@ -24,6 +25,44 @@ components:
       scheme: bearer
       bearerFormat: token
 
+  headers:
+    XCache:
+      description: >
+        Shows whether the response was returned from cache.
+        MISS means the service read data from PostgreSQL and then stored the response in cache.
+        HIT means the response was returned from cache.
+      schema:
+        type: string
+        enum:
+          - MISS
+          - HIT
+      example: HIT
+
+    XRateLimitLimit:
+      description: Maximum number of requests allowed in the current fixed window.
+      schema:
+        type: integer
+        example: 100
+
+    XRateLimitRemaining:
+      description: Number of requests remaining in the current fixed window.
+      schema:
+        type: integer
+        example: 57
+
+    XRateLimitReset:
+      description: Unix timestamp when the current rate limit window resets.
+      schema:
+        type: integer
+        format: int64
+        example: 1778150340
+
+    RetryAfter:
+      description: Number of seconds after which the client may retry the request.
+      schema:
+        type: integer
+        example: 60
+
   schemas:
     UserCreateRequest:
       type: object
@@ -34,20 +73,26 @@ components:
       properties:
         login:
           type: string
+          example: cache_test_user
         password:
           type: string
+          example: pass123
         full_name:
           type: string
+          example: Cache Test User
 
     UserResponse:
       type: object
       properties:
         id:
           type: integer
+          example: 1
         login:
           type: string
+          example: cache_test_user
         full_name:
           type: string
+          example: Cache Test User
 
     LoginRequest:
       type: object
@@ -57,14 +102,17 @@ components:
       properties:
         login:
           type: string
+          example: cache_test_user
         password:
           type: string
+          example: pass123
 
     LoginResponse:
       type: object
       properties:
         token:
           type: string
+          example: token-11-1
 
     DriverCreateRequest:
       type: object
@@ -76,28 +124,38 @@ components:
       properties:
         user_id:
           type: integer
+          example: 1
         car_model:
           type: string
+          example: Kia Rio
         car_number:
           type: string
+          example: A123BC777
         license_number:
           type: string
+          example: 77AB123456
 
     DriverResponse:
       type: object
       properties:
         id:
           type: integer
+          example: 1
         user_id:
           type: integer
+          example: 1
         car_model:
           type: string
+          example: Kia Rio
         car_number:
           type: string
+          example: A123BC777
         license_number:
           type: string
+          example: 77AB123456
         status:
           type: string
+          example: online
 
     RideCreateRequest:
       type: object
@@ -108,10 +166,13 @@ components:
       properties:
         passenger_id:
           type: integer
+          example: 1
         pickup_address:
           type: string
+          example: Lenina 10
         destination_address:
           type: string
+          example: Tverskaya 5
 
     RideAcceptRequest:
       type: object
@@ -120,22 +181,30 @@ components:
       properties:
         driver_id:
           type: integer
+          example: 1
 
     RideResponse:
       type: object
       properties:
         id:
           type: integer
+          example: 1
         passenger_id:
           type: integer
+          example: 1
         driver_id:
           type: integer
+          nullable: true
+          example: 0
         pickup_address:
           type: string
+          example: Lenina 10
         destination_address:
           type: string
+          example: Tverskaya 5
         status:
           type: string
+          example: searching
 
     MongoUserCreateRequest:
       type: object
@@ -159,7 +228,9 @@ components:
           example: Yakushina
         status:
           type: string
-          enum: [active, blocked]
+          enum:
+            - active
+            - blocked
           example: active
         email:
           type: string
@@ -195,107 +266,129 @@ components:
       properties:
         error:
           type: string
+          example: too many requests
 
 paths:
+  /ping:
+    get:
+      tags:
+        - Health
+      summary: Health check
+      responses:
+        "200":
+          description: Service is alive
+
   /users:
     post:
-      tags: [Users]
+      tags:
+        - Users
       summary: Create user
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/UserCreateRequest'
+              $ref: "#/components/schemas/UserCreateRequest"
       responses:
-        '201':
-          description: User created
+        "201":
+          description: User created. User cache is invalidated.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/UserResponse'
-        '400':
+                $ref: "#/components/schemas/UserResponse"
+        "400":
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '409':
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
           description: User already exists
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: "#/components/schemas/ErrorResponse"
 
     get:
-      tags: [Users]
+      tags:
+        - Users
       summary: Find user by login or name mask
+      description: >
+        This endpoint is cached.
+        The response contains X-Cache with HIT or MISS.
       parameters:
         - in: query
           name: login
           schema:
             type: string
+          description: Exact login lookup.
         - in: query
           name: name_mask
           schema:
             type: string
+          description: Case-insensitive user name search.
       responses:
-        '200':
+        "200":
           description: User or users found
+          headers:
+            X-Cache:
+              $ref: "#/components/headers/XCache"
           content:
             application/json:
               schema:
                 oneOf:
-                  - $ref: '#/components/schemas/UserResponse'
+                  - $ref: "#/components/schemas/UserResponse"
                   - type: array
                     items:
-                      $ref: '#/components/schemas/UserResponse'
-        '400':
-          description: Missing query parameter
+                      $ref: "#/components/schemas/UserResponse"
+        "400":
+          description: Missing or invalid query parameter
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '404':
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
           description: User not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: "#/components/schemas/ErrorResponse"
 
   /auth/login:
     post:
-      tags: [Auth]
+      tags:
+        - Auth
       summary: Login and get token
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/LoginRequest'
+              $ref: "#/components/schemas/LoginRequest"
       responses:
-        '200':
+        "200":
           description: Login success
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/LoginResponse'
-        '400':
+                $ref: "#/components/schemas/LoginResponse"
+        "400":
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '401':
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
           description: Invalid credentials
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: "#/components/schemas/ErrorResponse"
 
   /drivers:
     post:
-      tags: [Drivers]
+      tags:
+        - Drivers
       summary: Register driver
       security:
         - BearerAuth: []
@@ -304,37 +397,39 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/DriverCreateRequest'
+              $ref: "#/components/schemas/DriverCreateRequest"
       responses:
-        '201':
-          description: Driver created
+        "201":
+          description: Driver created. Driver cache is invalidated.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DriverResponse'
-        '400':
+                $ref: "#/components/schemas/DriverResponse"
+        "400":
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '401':
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
           description: Unauthorized
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '409':
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
           description: Driver cannot be created
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: "#/components/schemas/ErrorResponse"
 
   /rides:
     post:
-      tags: [Rides]
+      tags:
+        - Rides
       summary: Create ride
+      description: Creates a new ride and invalidates ride cache.
       security:
         - BearerAuth: []
       requestBody:
@@ -342,36 +437,40 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RideCreateRequest'
+              $ref: "#/components/schemas/RideCreateRequest"
       responses:
-        '201':
+        "201":
           description: Ride created
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RideResponse'
-        '400':
+                $ref: "#/components/schemas/RideResponse"
+        "400":
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '401':
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
           description: Unauthorized
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '409':
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
           description: Ride cannot be created
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: "#/components/schemas/ErrorResponse"
 
     get:
-      tags: [Rides]
+      tags:
+        - Rides
       summary: Get active rides or user ride history
+      description: >
+        This endpoint is cached.
+        For status=active it is also protected by fixed-window rate limiting.
       security:
         - BearerAuth: []
       parameters:
@@ -379,37 +478,68 @@ paths:
           name: user_id
           schema:
             type: integer
+          description: Passenger id for ride history lookup.
         - in: query
           name: status
           schema:
             type: string
-            enum: [active]
+            enum:
+              - active
+          description: Use status=active to get active rides.
       responses:
-        '200':
+        "200":
           description: List of rides
+          headers:
+            X-Cache:
+              $ref: "#/components/headers/XCache"
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/XRateLimitLimit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/XRateLimitRemaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/XRateLimitReset"
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/RideResponse'
-        '400':
+                  $ref: "#/components/schemas/RideResponse"
+        "400":
           description: Missing query parameter
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '401':
-          description: Unauthorized
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Unauthorized. Token is missing or invalid.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Too many requests. Rate limit exceeded for active rides.
+          headers:
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/XRateLimitLimit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/XRateLimitRemaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/XRateLimitReset"
+            Retry-After:
+              $ref: "#/components/headers/RetryAfter"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: too many requests
 
   /rides/{id}/accept:
     patch:
-      tags: [Rides]
+      tags:
+        - Rides
       summary: Accept ride by driver
+      description: Accepts a ride and invalidates ride cache.
       security:
         - BearerAuth: []
       parameters:
@@ -423,37 +553,39 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RideAcceptRequest'
+              $ref: "#/components/schemas/RideAcceptRequest"
       responses:
-        '200':
+        "200":
           description: Ride accepted
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RideResponse'
-        '400':
+                $ref: "#/components/schemas/RideResponse"
+        "400":
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '401':
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
           description: Unauthorized
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '409':
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
           description: Ride cannot be accepted
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: "#/components/schemas/ErrorResponse"
 
   /rides/{id}/complete:
     patch:
-      tags: [Rides]
+      tags:
+        - Rides
       summary: Complete ride
+      description: Completes a ride and invalidates ride cache.
       security:
         - BearerAuth: []
       parameters:
@@ -463,95 +595,97 @@ paths:
           schema:
             type: integer
       responses:
-        '200':
+        "200":
           description: Ride completed
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RideResponse'
-        '400':
+                $ref: "#/components/schemas/RideResponse"
+        "400":
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '401':
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
           description: Unauthorized
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '409':
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
           description: Ride cannot be completed
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: "#/components/schemas/ErrorResponse"
 
   /mongo/users:
     post:
-      tags: [Mongo Users]
+      tags:
+        - Mongo Users
       summary: Create user in MongoDB
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/MongoUserCreateRequest'
+              $ref: "#/components/schemas/MongoUserCreateRequest"
       responses:
-        '201':
+        "201":
           description: Mongo user created
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/MongoUserResponse'
-        '400':
+                $ref: "#/components/schemas/MongoUserResponse"
+        "400":
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '409':
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
           description: User already exists in MongoDB
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: "#/components/schemas/ErrorResponse"
 
     get:
-      tags: [Mongo Users]
+      tags:
+        - Mongo Users
       summary: Find Mongo user by login or name mask
       parameters:
         - in: query
           name: login
           schema:
             type: string
-          description: Exact login lookup
+          description: Exact login lookup.
         - in: query
           name: name_mask
           schema:
             type: string
-          description: Case-insensitive substring search in first_name or last_name
+          description: Case-insensitive substring search in first_name or last_name.
       responses:
-        '200':
+        "200":
           description: Mongo user or users found
           content:
             application/json:
               schema:
                 oneOf:
-                  - $ref: '#/components/schemas/MongoUserResponse'
+                  - $ref: "#/components/schemas/MongoUserResponse"
                   - type: array
                     items:
-                      $ref: '#/components/schemas/MongoUserResponse'
-        '400':
+                      $ref: "#/components/schemas/MongoUserResponse"
+        "400":
           description: Invalid query parameters
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '404':
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
           description: Mongo user not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: "#/components/schemas/ErrorResponse"
