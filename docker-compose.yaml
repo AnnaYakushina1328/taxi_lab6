@@ -33,6 +33,22 @@ services:
       retries: 10
       start_period: 10s
 
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: taxi-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: taxi
+      RABBITMQ_DEFAULT_PASS: taxi123
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   taxi-service:
     build:
       context: .
@@ -62,6 +78,42 @@ services:
       retries: 5
       start_period: 5s
 
+  event-consumer:
+    build:
+      context: ./event_service
+      dockerfile: Dockerfile
+    container_name: taxi-event-consumer
+    restart: unless-stopped
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: taxi
+      RABBITMQ_PASSWORD: taxi123
+      READ_MODEL_PATH: /data/read_model.json
+    volumes:
+      - event-data:/data
+    command: ["python", "consumer.py"]
+
+  event-producer:
+    build:
+      context: ./event_service
+      dockerfile: Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: taxi
+      RABBITMQ_PASSWORD: taxi123
+    command: ["python", "test_events.py"]
+    profiles:
+      - tools
+
 volumes:
   postgres-data:
   mongo-data:
+  event-data:

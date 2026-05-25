@@ -1,263 +1,201 @@
-# Лабораторная работа 5. Кеширование и rate limiting в сервисе такси
+# Лабораторная работа 6. Event-Driven архитектура в сервисе такси
 
 Вариант 16: система заказа такси.
 
 ## Что делает проект
 
-В проекте есть три основные сущности:
+Проект сделан на основе предыдущей лабораторной работы с сервисом такси. В системе остаются основные сущности:
 
 - пользователь;
 - водитель;
 - поездка.
 
-По API можно создать пользователя, найти пользователя по логину или имени, зарегистрировать водителя, создать заказ поездки, получить активные заказы, принять поездку водителем, посмотреть историю поездок пользователя и завершить поездку.
+Базовый сценарий такой: пассажир создаёт заказ, водитель принимает его, после выполнения поездка завершается и попадает в историю.
 
-В пятой лабораторной работе добавлены:
+В шестой лабораторной добавлена событийная часть. Теперь важные изменения в системе можно передавать как события через RabbitMQ.
 
-- кеширование часто повторяющихся GET-запросов;
-- очистка кеша после изменения данных;
-- ограничение частоты запросов для активных заказов;
-- описание выбранного решения в файле `performance_design.md`.
+## Какие события используются
 
-## Важное замечание про авторизацию
+В проекте описаны события:
 
-Большая часть API защищена авторизацией. Если выполнять проверочные GET-запросы без токена, сервис вернёт:
+- `user.created`;
+- `driver.registered`;
+- `ride.created`;
+- `ride.accepted`;
+- `ride.completed`.
 
-    HTTP/1.1 401 Unauthorized
+Эти события соответствуют основным действиям в системе заказа такси.
 
-Поэтому перед проверкой кеширования и rate limiting нужно сначала создать тестового пользователя, получить токен через `/auth/login` и дальше передавать его в заголовке:
+## Что добавлено в шестой лабораторной
 
-    Authorization: Bearer $TOKEN
+Добавлены файлы:
 
-Подробные команды для этого приведены ниже в разделе проверки.
+- `event_driven_design.md` — описание событийной архитектуры;
+- `event_catalog.md` — каталог событий;
+- `event_service/producer.py` — отправка событий в RabbitMQ;
+- `event_service/consumer.py` — обработка событий поездок;
+- `event_service/test_events.py` — тестовый сценарий;
+- `event_service/rabbitmq_client.py` — подключение к RabbitMQ и создание exchange/queues;
+- `event_service/Dockerfile` — сборка сервиса событий;
+- `docker-compose.yaml` — запуск API, баз данных, RabbitMQ и consumer.
 
-## Что кешируется
+## RabbitMQ
 
-Кеширование добавлено для endpoint-ов:
+Используется RabbitMQ с management UI.
 
-- `GET /users?login=...`
-- `GET /users?name_mask=...`
-- `GET /rides?status=active`
-- `GET /rides?user_id=...`
+Exchange:
 
-Используется стратегия Cache-Aside. Сначала сервис смотрит, есть ли готовый ответ в кеше. Если есть, он сразу отдаёт его клиенту. Если нет, сервис идёт в PostgreSQL, формирует JSON-ответ и сохраняет его в кеш на короткое время.
+```text
+taxi.events
+```
 
-Для проверки работы кеша в ответ добавлен заголовок:
+Тип exchange:
 
-- `X-Cache: MISS` — ответ был собран через запрос к базе;
-- `X-Cache: HIT` — ответ был взят из кеша.
+```text
+topic
+```
 
-TTL:
+Routing key совпадает с названием события:
 
-- пользователи — 60 секунд;
-- история поездок пользователя — 60 секунд;
-- активные поездки — 15 секунд.
+```text
+ride.created
+ride.accepted
+ride.completed
+```
 
-Для активных поездок TTL меньше, потому что список доступных заказов в такси быстро устаревает.
+## Очереди
 
-## Инвалидация кеша
+| Очередь | Что получает |
+|---|---|
+| taxi.notifications | события для возможных уведомлений |
+| taxi.ride_read_model | события поездок для read-модели |
+| taxi.audit | все события |
 
-Кеш очищается после операций, которые меняют данные:
+В коде consumer слушает очередь `taxi.audit`, поэтому в логах видны все события. При этом read-модель обновляется только по событиям поездок.
 
-- `POST /users` — очищается кеш пользователей;
-- `POST /drivers` — очищается кеш водителей;
-- `POST /rides` — очищается кеш поездок;
-- `PATCH /rides/{id}/accept` — очищается кеш поездок;
-- `PATCH /rides/{id}/complete` — очищается кеш поездок.
+## Запуск
 
-Например, если пассажир создал новую поездку, список активных заказов должен обновиться. Поэтому после создания поездки кеш с префиксом `rides:` очищается.
+Собрать и запустить контейнеры:
 
-## Rate limiting
+```bash
+docker compose up --build -d
+```
 
-Rate limiting добавлен для endpoint-а:
+Проверить состояние:
 
-- `GET /rides?status=active`
+```bash
+docker compose ps
+```
 
-Этот endpoint выбран потому, что его могут часто вызывать водители, когда ищут доступные заказы.
+RabbitMQ UI:
 
-Алгоритм:
+```text
+http://localhost:15672
+```
 
-- Fixed Window Counter.
+Логин:
 
-Лимит:
+```text
+taxi
+```
 
-- 100 запросов в минуту.
+Пароль:
 
-Если лимит превышен, сервис возвращает:
+```text
+taxi123
+```
 
-- `HTTP 429 Too Many Requests`.
+## Проверка событий
 
-Также в ответе есть заголовки:
+Отправить тестовую цепочку событий:
 
-- `X-RateLimit-Limit`;
-- `X-RateLimit-Remaining`;
-- `X-RateLimit-Reset`;
-- `Retry-After`.
+```bash
+docker compose run --rm event-producer
+```
 
-## Основные файлы
+Посмотреть логи consumer:
 
-Файлы, которые относятся к пятой лабораторной:
+```bash
+docker compose logs event-consumer
+```
 
-- `performance_design.md` — описание решения по кешированию и rate limiting;
-- `src/performance/simple_performance.hpp` — реализация кеша и rate limiter;
-- `src/handlers/users_get.cpp` — кеширование поиска пользователей;
-- `src/handlers/rides_get.cpp` — кеширование поездок и rate limiting;
-- `src/handlers/users_create.cpp` — очистка кеша пользователей;
-- `src/handlers/drivers_create.cpp` — очистка кеша водителей;
-- `src/handlers/rides_create.cpp` — очистка кеша поездок;
-- `src/handlers/rides_accept.cpp` — очистка кеша после принятия поездки;
-- `src/handlers/rides_complete.cpp` — очистка кеша после завершения поездки;
-- `Dockerfile` — сборка приложения;
-- `docker-compose.yaml` — запуск приложения, PostgreSQL и MongoDB.
+Проверить read-модель:
 
-## Быстрый запуск для проверки
+```bash
+docker compose exec event-consumer cat /data/read_model.json
+```
 
-Склонировать репозиторий:
+После тестового сценария поездка должна оказаться в `completed_rides`.
 
-    git clone https://github.com/AnnaYakushina1328/taxi_lab5.git
-    cd taxi_lab5
+## Отправка одного события вручную
 
-Запустить проект:
+Создать событие новой поездки:
 
-    docker compose up --build -d
+```bash
+docker compose run --rm event-producer python producer.py ride.created --ride-id 200 --user-id 1 --from-address "MAI" --to-address "Airport"
+```
 
-Проверить контейнеры:
+Принять поездку:
 
-    docker compose ps
+```bash
+docker compose run --rm event-producer python producer.py ride.accepted --ride-id 200 --driver-id 10
+```
 
-Нужно дождаться, чтобы сервисы были в состоянии `healthy`.
+Завершить поездку:
 
-Остановить проект после проверки:
+```bash
+docker compose run --rm event-producer python producer.py ride.completed --ride-id 200 --driver-id 10 --user-id 1 --price 900
+```
 
-    docker compose down -v
+Проверить read-модель:
 
-## Получение токена для проверки
+```bash
+docker compose exec event-consumer cat /data/read_model.json
+```
 
-API защищён авторизацией, поэтому сначала нужно получить токен.
+## CQRS
 
-Создать тестового пользователя:
+CQRS применён в упрощённом виде.
 
-    curl -s -X POST "http://localhost:8080/users" -H "Content-Type: application/json" -d '{"login":"cache_test_user","password":"pass123","full_name":"Cache Test User"}'
+Команды меняют состояние:
 
-Если пользователь уже существует, это не страшно. Можно сразу выполнить логин.
+- создание пользователя;
+- регистрация водителя;
+- создание заказа;
+- принятие заказа;
+- завершение поездки.
 
-Получить токен:
+Запросы читают подготовленное состояние:
 
-    TOKEN=$(curl -s -X POST "http://localhost:8080/auth/login" -H "Content-Type: application/json" -d '{"login":"cache_test_user","password":"pass123"}' | python3 -c 'import sys,json; print(json.load(sys.stdin).get("token",""))')
+- активные поездки;
+- принятые поездки;
+- завершённые поездки.
 
-Проверить, что токен получен:
+Consumer обновляет отдельную read-модель на основе событий. В этой лабораторной она хранится в JSON-файле, чтобы результат было легко проверить. В настоящем сервисе такую модель можно было бы хранить в MongoDB, Redis или отдельной таблице.
 
-    echo $TOKEN
+## Гарантии доставки
 
-Если команда вывела пустую строку, значит токен не получен и защищённые запросы вернут `401 Unauthorized`.
+Используется гарантия `at-least-once`.
 
-Дальше во всех проверочных запросах используется заголовок:
+Для этого в RabbitMQ используются durable queues, persistent messages и ручное подтверждение обработки. Если consumer не смог обработать сообщение, оно возвращается обратно в очередь.
 
-    -H "Authorization: Bearer $TOKEN"
+## Остановка
 
-## Проверка кеша на активных поездках
+Остановить контейнеры:
 
-Первый запрос должен пойти в базу и вернуть `X-Cache: MISS`:
+```bash
+docker compose down
+```
 
-    curl -s -D - -o /tmp/rides_1.json -H "Authorization: Bearer $TOKEN" "http://localhost:8080/rides?status=active" | grep -Ei "HTTP/|X-Cache|X-RateLimit"
-    cat /tmp/rides_1.json
+Остановить и удалить volumes:
 
-Повторный такой же запрос должен вернуться из кеша и показать `X-Cache: HIT`:
-
-    curl -s -D - -o /tmp/rides_2.json -H "Authorization: Bearer $TOKEN" "http://localhost:8080/rides?status=active" | grep -Ei "HTTP/|X-Cache|X-RateLimit"
-    cat /tmp/rides_2.json
-
-Ожидаемый результат:
-
-    X-Cache: MISS
-    X-Cache: HIT
-
-У этого же endpoint-а должны быть заголовки rate limiting:
-
-    X-RateLimit-Limit
-    X-RateLimit-Remaining
-    X-RateLimit-Reset
-
-## Проверка кеша на истории поездок
-
-Первый запрос:
-
-    curl -s -D - -o /tmp/rides_history_1.json -H "Authorization: Bearer $TOKEN" "http://localhost:8080/rides?user_id=1" | grep -Ei "HTTP/|X-Cache"
-    cat /tmp/rides_history_1.json
-
-Повторный запрос:
-
-    curl -s -D - -o /tmp/rides_history_2.json -H "Authorization: Bearer $TOKEN" "http://localhost:8080/rides?user_id=1" | grep -Ei "HTTP/|X-Cache"
-    cat /tmp/rides_history_2.json
-
-Ожидаемый результат:
-
-    X-Cache: MISS
-    X-Cache: HIT
-
-Если сразу появился `X-Cache: HIT`, значит этот запрос уже выполнялся раньше и ответ ещё не успел устареть по TTL.
-
-## Проверка кеша на пользователях
-
-Первый запрос:
-
-    curl -s -D - -o /tmp/users_1.json -H "Authorization: Bearer $TOKEN" "http://localhost:8080/users?name_mask=Cache" | grep -Ei "HTTP/|X-Cache"
-    cat /tmp/users_1.json
-
-Повторный запрос:
-
-    curl -s -D - -o /tmp/users_2.json -H "Authorization: Bearer $TOKEN" "http://localhost:8080/users?name_mask=Cache" | grep -Ei "HTTP/|X-Cache"
-    cat /tmp/users_2.json
-
-Ожидаемый результат:
-
-    X-Cache: MISS
-    X-Cache: HIT
-
-## Проверка rate limiting
-
-Перед проверкой можно подождать минуту, чтобы счётчик запросов был чистым:
-
-    sleep 65
-
-Запустить 105 запросов подряд:
-
-    for i in $(seq 1 105); do curl -s -o /dev/null -w "$i -> %{http_code}\n" -H "Authorization: Bearer $TOKEN" "http://localhost:8080/rides?status=active"; done
-
-До сотого запроса должны возвращаться ответы `200`. После превышения лимита должны появиться `429`.
-
-Пример:
-
-    99 -> 200
-    100 -> 200
-    101 -> 429
-    102 -> 429
-
-Проверить заголовки после превышения лимита:
-
-    curl -i -H "Authorization: Bearer $TOKEN" "http://localhost:8080/rides?status=active"
-
-Ожидаемые заголовки:
-
-    HTTP/1.1 429 Too Many Requests
-    X-RateLimit-Limit: 100
-    X-RateLimit-Remaining: 0
-    X-RateLimit-Reset: ...
-    Retry-After: 60
-
-Если при проверке сразу возвращается `429`, значит лимит уже был израсходован в текущем минутном окне. Нужно подождать около минуты и повторить запрос.
-
-## Короткая проверка одной командой
-
-После запуска Docker и получения токена можно быстро проверить кеш активных поездок:
-
-    curl -s -D - -o /tmp/rides_1.json -H "Authorization: Bearer $TOKEN" "http://localhost:8080/rides?status=active" | grep -Ei "HTTP/|X-Cache|X-RateLimit"
-    curl -s -D - -o /tmp/rides_2.json -H "Authorization: Bearer $TOKEN" "http://localhost:8080/rides?status=active" | grep -Ei "HTTP/|X-Cache|X-RateLimit"
-
-В выводе должно быть сначала `X-Cache: MISS`, потом `X-Cache: HIT`.
+```bash
+docker compose down -v
+```
 
 ## Документация
 
-Подробное описание выбора hot paths, TTL, инвалидации кеша и rate limiting находится в файле:
+Основные документы по шестой лабораторной:
 
-- `performance_design.md`
+- `event_driven_design.md`;
+- `event_catalog.md`.
